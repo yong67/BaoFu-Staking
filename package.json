@@ -9,12 +9,13 @@
     "deploy": "hardhat run scripts/deploy.js --network testnet"
   },
   "devDependencies": {
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.12",
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "dotenv": "^16.4.1",
     "hardhat": "^2.24.1"
   },
   "dependencies": {
-    "@chainlink/contracts": "0.6.1",
+    "@chainlink/contracts": "^0.6.1",
     "@openzeppelin/contracts": "4.9.3",
     "@pancakeswap/v2-core": "github:pancakeswap/pancake-swap-core",
     "@pancakeswap/v2-periphery": "github:pancakeswap/pancake-swap-periphery"

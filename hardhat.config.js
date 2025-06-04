@@ -1,4 +1,5 @@
 require("@nomicfoundation/hardhat-toolbox");
+require("@nomicfoundation/hardhat-verify");
 require("dotenv").config();
 
 /** @type import('hardhat/config').HardhatUserConfig */
@@ -13,14 +14,27 @@ module.exports = {
     }
   },
   networks: {
+    hardhat: {
+      forking: {
+        url: process.env.RPC_URL,
+      },
+      hardfork: "cancun"
+    },
     testnet: {
       url: process.env.RPC_URL,
       accounts: [process.env.PRIVATE_KEY],
       chainId: 97
+    },
+    bscTestnet: {
+      url: process.env.RPC_URL,
+      chainId: 97,
+      accounts: [process.env.PRIVATE_KEY],
+      gasPrice: 20000000000,
     }
   },
   etherscan: {
     apiKey: {
+      bsc: process.env.BSC_SCAN_API_KEY,
       bscTestnet: process.env.BSC_SCAN_API_KEY
     },
     customChains: [
@@ -33,5 +47,8 @@ module.exports = {
         }
       }
     ]
+  },
+  mocha: {
+    timeout: 120000 // 120 seconds
   }
 };

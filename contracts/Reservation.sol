@@ -88,6 +88,9 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
     uint256 public constant TARGET_RETURN = 100;          // 目标收益率：100%
     uint256 public constant REF_TOKEN_AMOUNT = 1e18;      // 建立推荐关系所需的REF代币数量：1 REF
     
+    // 销毁地址 - 用于销毁多余的BAOFU代币
+    address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+    
     // 事件定义
     event ReservationCreated(address indexed user, uint256 amount, uint256 baofuAmount);    // 预约创建事件
     event ReservationClosed(address indexed user, uint256 returnAmount, uint256 profit);    // 预约关闭事件
@@ -279,33 +282,72 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
     }
     
     /**
-     * @dev 关闭预约的函数
-     * @notice 用户可以在锁仓期结束后手动关闭预约
+     * @dev 关闭预约
+     * @notice 用户可以在锁仓期结束后关闭预约，提取对应的BAOFU代币
      */
-    function closeReservation() external nonReentrant {
+    function closeReservation() external {
+        require(reservations[msg.sender].isActive, "No active reservation");
+        require(block.timestamp >= reservations[msg.sender].timestamp + LOCK_PERIOD, "Lock period not ended");
+        
         ReservationData storage reservation = reservations[msg.sender];
-        require(reservation.isActive, "No active reservation");
-        require(block.timestamp >= reservation.timestamp + LOCK_PERIOD, "Lock period not ended");
         
-        // 计算应返还的 BAOFU 数量（本金 + 100% 利润）
-        uint256 totalBAOFUAmount = reservation.baofuAmount * 2; // 100% 收益
+        // 计算当前BAOFU的USDT价值
+        uint256 currentBAOFUValueInUSDT = _getBAOFUValueInUSDT(reservation.baofuAmount);
         
-        // 检查合约是否有足够的 BAOFU
-        require(mBAOFU.balanceOf(address(this)) >= totalBAOFUAmount, "Insufficient BAOFU in contract");
+        // 计算收益率
+        uint256 returnPercentage = (currentBAOFUValueInUSDT * 100) / reservation.originalMBNBValue;
         
-        // 转账 BAOFU 给用户
-        require(mBAOFU.transfer(msg.sender, totalBAOFUAmount), "BAOFU transfer failed");
+        // 计算利润金额（以USDT计算）
+        uint256 profitInUSDT = currentBAOFUValueInUSDT > reservation.originalMBNBValue ? 
+            currentBAOFUValueInUSDT - reservation.originalMBNBValue : 0;
         
-        // 计算利润（以 BAOFU 计算）
-        uint256 profit = reservation.baofuAmount;
+        if (returnPercentage >= 200) {
+            // 达到或超过100%收益：强制平仓逻辑
+            // 1. 用户拿回原始投资金额等值的BAOFU
+            uint256 originalInvestmentBAOFU = _calculateBAOFUAmountFromUSDT(reservation.originalMBNBValue);
+            
+            // 2. 利润部分的BAOFU用来支付推荐奖励
+            uint256 profitBAOFU = _calculateBAOFUAmountFromUSDT(reservation.originalMBNBValue); // 100%利润对应的BAOFU
+            
+            // 3. 超过200%的部分销毁
+            uint256 totalValidBAOFU = originalInvestmentBAOFU + profitBAOFU; // 最多200%对应的BAOFU
+            if (reservation.baofuAmount > totalValidBAOFU) {
+                uint256 excessBAOFU = reservation.baofuAmount - totalValidBAOFU;
+                _burnExcessBAOFU(excessBAOFU);
+            }
+            
+            // 返还用户原始投资金额对应的BAOFU
+            require(mBAOFU.transfer(msg.sender, originalInvestmentBAOFU), "BAOFU transfer failed");
+            
+            profitInUSDT = reservation.originalMBNBValue; // 100%利润（以USDT计算）
+            
+            emit ReservationClosed(msg.sender, originalInvestmentBAOFU, profitInUSDT);
+        } else {
+            // 未达到100%收益：返还所有BAOFU
+            require(mBAOFU.transfer(msg.sender, reservation.baofuAmount), "BAOFU transfer failed");
+            
+            emit ReservationClosed(msg.sender, reservation.baofuAmount, profitInUSDT);
+        }
         
-        // 根据 MockREF 系统支付推荐奖励（使用原始 mBNB 数量计算）
+        // 在删除预约数据之前支付推荐奖励
         _payReferralRewards(msg.sender);
         
         // 清除预约
         delete reservations[msg.sender];
+    }
+    
+    /**
+     * @dev 根据USDT金额计算对应的BAOFU数量
+     * @param usdtAmount USDT金额
+     * @return 对应的BAOFU数量
+     */
+    function _calculateBAOFUAmountFromUSDT(uint256 usdtAmount) internal view returns (uint256) {
+        address[] memory path = new address[](2);
+        path[0] = address(mUSDT);
+        path[1] = address(mBAOFU);
         
-        emit ReservationClosed(msg.sender, reservation.baofuAmount, profit);
+        uint[] memory amounts = pancakeRouter.getAmountsOut(usdtAmount, path);
+        return amounts[1];
     }
     
     /**
@@ -320,11 +362,14 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
         ReservationData storage reservation = reservations[user];
         uint256 actualTradeValue = _getBAOFUValueInUSDT(reservation.baofuAmount);
         
-        // 确保有足够的mBNB支付奖励
-        uint256 availableMBNB = mBNB.balanceOf(address(this));
-        if (availableMBNB == 0) return;
+        // 计算利润金额（以USDT计算）
+        uint256 profitInUSDT = actualTradeValue > reservation.originalMBNBValue ? 
+            actualTradeValue - reservation.originalMBNBValue : 0;
+        
+        // 如果没有利润，就没有奖励可分配
+        if (profitInUSDT == 0) return;
 
-        // 计算总奖励金额
+        // 计算总奖励比例
         uint256 totalRewardPercentage = 0;
         address tempReferrer = currentReferrer;
         uint256 tempLevel = 0;
@@ -339,35 +384,34 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
             tempLevel++;
         }
         
-        // 计算总奖励金额（基于实际成交金额）
-        uint256 totalRewardMBNB = (actualTradeValue * totalRewardPercentage) / 1000;
-        
-        // 如果奖励金额超过可用mBNB，按比例缩减
-        if (totalRewardMBNB > availableMBNB) {
-            totalRewardMBNB = availableMBNB;
-        }
+        // 如果没有推荐奖励比例，直接返回
+        if (totalRewardPercentage == 0) return;
         
         // 第二次遍历：分配奖励
         uint256 level = 0;
-        uint256 remainingReward = totalRewardMBNB;
         
-        while (currentReferrer != address(0) && level < 8 && remainingReward > 0) {
+        while (currentReferrer != address(0) && level < 8) {
             uint256 referralCount = mREF.referralCount(currentReferrer);
             uint256 rewardPercentage = _getRewardPercentage(referralCount, level);
             
             if (rewardPercentage > 0) {
-                // 计算当前级别的奖励金额
-                uint256 levelReward = (totalRewardMBNB * rewardPercentage) / totalRewardPercentage;
+                // 基于利润金额计算当前级别的奖励USDT金额
+                uint256 levelRewardUSDT = (profitInUSDT * rewardPercentage) / 1000;
                 
-                // 确保不超过剩余奖励
-                if (levelReward > remainingReward) {
-                    levelReward = remainingReward;
-                }
-                
-                if (levelReward > 0) {
-                    require(mBNB.transfer(currentReferrer, levelReward), "mBNB reward transfer failed");
-                    remainingReward -= levelReward;
-                    emit ReferralRewardPaid(currentReferrer, user, levelReward, level + 1);
+                if (levelRewardUSDT > 0) {
+                    // 将奖励USDT金额转换成BAOFU数量
+                    uint256 levelRewardBAOFU = _calculateBAOFUAmountFromUSDT(levelRewardUSDT);
+                    
+                    // 检查合约是否有足够的BAOFU
+                    uint256 contractBAOFUBalance = mBAOFU.balanceOf(address(this));
+                    if (levelRewardBAOFU > contractBAOFUBalance) {
+                        levelRewardBAOFU = contractBAOFUBalance; // 如果不够，就用剩余的全部
+                    }
+                    
+                    if (levelRewardBAOFU > 0) {
+                        require(mBAOFU.transfer(currentReferrer, levelRewardBAOFU), "BAOFU reward transfer failed");
+                        emit ReferralRewardPaid(currentReferrer, user, levelRewardBAOFU, level + 1);
+                    }
                 }
             }
             
@@ -571,69 +615,53 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
             bool isOver24Hours = block.timestamp >= reservation.timestamp + LOCK_PERIOD;
             bool is100PercentReturn = currentBAOFUValue >= reservation.originalMBNBValue * 2;
             
-            // 计算应返还的BAOFU数量
-            uint256 returnAmount;
-            if (!isOver24Hours && is100PercentReturn) {
-                // 24小时内达到100%收益：强制平仓，返还原始投资金额的BAOFU
-                returnAmount = _calculateOriginalInvestmentBAOFU(reservation);
-            } else if (isOver24Hours) {
-                // 超过24小时：按实时价格计算，确保返还原始投资金额
-                returnAmount = _calculateReturnAmount(reservation);
-            } else {
-                continue; // 不满足任何条件，跳过
+            // 检查是否满足自动关闭条件
+            if ((!isOver24Hours && is100PercentReturn) || isOver24Hours) {
+                // 计算收益率
+                uint256 returnPercentage = (currentBAOFUValue * 100) / reservation.originalMBNBValue;
+                
+                uint256 returnAmount;
+                uint256 profit;
+                
+                if (returnPercentage >= 200) {
+                    // 达到或超过100%收益：强制平仓
+                    // 1. 用户拿回原始投资金额等值的BAOFU
+                    returnAmount = _calculateBAOFUAmountFromUSDT(reservation.originalMBNBValue);
+                    
+                    // 2. 利润部分的BAOFU用来支付推荐奖励
+                    uint256 profitBAOFU = _calculateBAOFUAmountFromUSDT(reservation.originalMBNBValue); // 100%利润对应的BAOFU
+                    
+                    // 3. 超过200%的部分销毁
+                    uint256 totalValidBAOFU = returnAmount + profitBAOFU; // 最多200%对应的BAOFU
+                    if (reservation.baofuAmount > totalValidBAOFU) {
+                        uint256 excessBAOFU = reservation.baofuAmount - totalValidBAOFU;
+                        _burnExcessBAOFU(excessBAOFU);
+                    }
+                    
+                    // 返还用户原始投资金额对应的BAOFU
+                    require(mBAOFU.transfer(user, returnAmount), "BAOFU transfer failed");
+                    
+                    profit = reservation.originalMBNBValue; // 100%利润（以USDT计算）
+                } else {
+                    // 未达到100%收益：返还所有BAOFU
+                    returnAmount = reservation.baofuAmount;
+                    
+                    // 返还用户所有BAOFU
+                    require(mBAOFU.transfer(user, returnAmount), "BAOFU transfer failed");
+                    
+                    profit = currentBAOFUValue > reservation.originalMBNBValue ? 
+                        currentBAOFUValue - reservation.originalMBNBValue : 0;
+                }
+                
+                // 在删除预约数据之前支付推荐奖励
+                _payReferralRewards(user);
+                
+                // 清除预约
+                delete reservations[user];
+                
+                emit ReservationAutoClosed(user, returnAmount, profit, !isOver24Hours && is100PercentReturn);
             }
-            
-            // 转账BAOFU给用户
-            require(mBAOFU.transfer(user, returnAmount), "BAOFU transfer failed");
-            
-            // 计算利润并销毁多余部分
-            uint256 profit = returnAmount > reservation.baofuAmount ? 
-                returnAmount - reservation.baofuAmount : 0;
-            
-            if (profit > 0) {
-                // 销毁多余的BAOFU
-                _burnExcessBAOFU(profit);
-            }
-            
-            // 支付推荐奖励
-            _payReferralRewards(user);
-            
-            // 清除预约
-            delete reservations[user];
-            
-            emit ReservationAutoClosed(user, returnAmount, profit, !isOver24Hours && is100PercentReturn);
         }
-    }
-
-    /**
-     * @dev 计算原始投资金额对应的BAOFU数量
-     * @param reservation 预约数据
-     * @return 原始投资金额对应的BAOFU数量
-     */
-    function _calculateOriginalInvestmentBAOFU(ReservationData storage reservation) internal view returns (uint256) {
-        address[] memory path = new address[](2);
-        path[0] = address(mUSDT);
-        path[1] = address(mBAOFU);
-        
-        uint[] memory amounts = pancakeRouter.getAmountsOut(reservation.originalMBNBValue, path);
-        return amounts[1];
-    }
-
-    /**
-     * @dev 计算应返还的BAOFU数量（确保返还原始投资金额）
-     * @param reservation 预约数据
-     * @return 应返还的BAOFU数量
-     */
-    function _calculateReturnAmount(ReservationData storage reservation) internal view returns (uint256) {
-        uint256 currentBAOFUValue = _getBAOFUValueInUSDT(reservation.baofuAmount);
-        uint256 targetValue = reservation.originalMBNBValue;
-        
-        if (currentBAOFUValue <= targetValue) {
-            return reservation.baofuAmount; // 如果亏损，返还原始数量
-        }
-        
-        // 计算需要返还的BAOFU数量以达到原始投资价值
-        return _calculateOriginalInvestmentBAOFU(reservation);
     }
 
     /**
@@ -641,8 +669,8 @@ contract Reservation is Ownable, ReentrancyGuard, AutomationCompatibleInterface 
      * @param amount 要销毁的BAOFU数量
      */
     function _burnExcessBAOFU(uint256 amount) internal {
-        // 将BAOFU转入零地址实现销毁
-        require(mBAOFU.transfer(address(0), amount), "BAOFU burn failed");
+        // 将BAOFU转入死亡地址实现销毁（更安全的销毁方式）
+        require(mBAOFU.transfer(BURN_ADDRESS, amount), "BAOFU burn failed");
     }
 
     /**
